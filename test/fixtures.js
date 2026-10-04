@@ -7,7 +7,7 @@
 const db = require('../src/db');
 
 async function setupTest() {
-  await db.query(`TRUNCATE update_errors, doc_snapshots, doc_updates,
+  await db.query(`TRUNCATE update_errors, doc_checkpoints, doc_snapshots, doc_updates,
                   document_members, documents, users, tenants RESTART IDENTITY CASCADE`);
 
   await db.query(`INSERT INTO tenants (id,name) VALUES

@@ -30,6 +30,7 @@ HTTP/WebSocket，PostgreSQL 保存只增的更新日志与压缩快照。不存�
                     PostgreSQL
                     doc_updates      只增更新日志 (doc_id, seq) / (doc_id, client_msg_id)
                     doc_snapshots    压缩快照（through_seq + state + sha256）
+                    doc_checkpoints  命名教学检查点（name + seq + 全量 Yjs 状态 + sha256）
                     update_errors    未知/损坏/越权帧的可定位错误
 ```
 
@@ -83,6 +84,29 @@ hello 和 `sync-req` 都接受 Yjs 状态向量：服务器返回
 `doc_id / user_id / tenant_id / client_msg_id / raw_len / raw_prefix_hex /
 error_code / error_message`。区分 `BAD_JSON`、`BAD_ENVELOPE`、`BAD_ENCODING`、
 `CORRUPT_UPDATE`、`FORBIDDEN`、`UNKNOWN_TYPE` 等（T7）。
+
+### 命名教学检查点
+
+`POST /v1/docs/:docId/checkpoints {name}` 在该文档的**串行队列内**从当前一致
+状态生成一个命名检查点：编码实时内存 Y.Doc 的全量状态，并先用「只从
+PostgreSQL 重建到同一 seq」独立校验逐字节相等，然后写入
+`doc_checkpoints(name, created_by, seq, state_bytes, state_hash)`。
+
+* 检查点行**不可变**：后续普通更新只追加 `doc_updates`，压缩只折叠
+  `doc_updates → doc_snapshots`，两条路径都不触碰检查点；即使
+  `deleteFolded:true` 物理删除了全部已折叠日志，检查点仍可原样读取（T11）。
+* 读取时重新校验 `sha256(state_bytes) == state_hash`，损坏行报错而不是
+  静默返回错误内容。
+* 只读视图：本系统不提供「回滚当前文档到检查点」的接口。
+* 接口（同一套租户/成员校验，见 §2）：
+  * `POST /v1/docs/:docId/checkpoints` — writer/owner 创建；重名返回 `409`；
+  * `GET  /v1/docs/:docId/checkpoints` — 任意活跃成员列出（含 reader）；
+  * `GET  /v1/docs/:docId/checkpoints/:name` — 任意活跃成员读取，返回
+    `seq / stateHash / text / sv / state(base64)`。
+
+`npm run demo:checkpoint` 演示：编辑① → 建检查点 → 编辑② → 读检查点
+（仍是旧内容旧哈希）→ `deleteFolded` 压缩 → 再读检查点（仍一致）→
+跨租户读取被拒。
 
 ---
 
@@ -159,6 +183,12 @@ curl -s -H 'x-auth-token: user-owner' \
   http://127.0.0.1:7777/v1/docs/doc-demo/recovered-state
 ```
 
+检查点演示（编辑① → 建检查点 → 编辑② → 压缩删日志 → 复读检查点）：
+
+```bash
+npm run demo:checkpoint
+```
+
 种子身份（demo 用，用户 id 即 bearer token）：
 
 | 用户 | 租户 | 对 doc-demo 的角色 |
@@ -191,6 +221,7 @@ npm test
 | T8 | 非成员、跨租户、未知 token、reader 写、会话中途撤销权限、HTTP 端点越权全部被拒 |
 | T9 | 3 客户端 60 个最大并发的插入/删除，收敛到同一哈希；日志恰好 61 行，无丢失/重复 |
 | T10 | 正常 SIGTERM 重启后，旧 SV 重连与冷副本全量加入都与重启前哈希一致，且不重复落库 |
+| T11 | 命名检查点：创建后继续编辑仍显示旧内容/旧哈希；`deleteFolded` 压缩删光日志后仍可读取；跨租户/非成员/reader 越权被拒；当前文档协作与恢复不受影响 |
 
 ---
 
@@ -205,12 +236,14 @@ src/yutil.js             Yjs 文档/状态向量/差异/校验/恢复
 src/room.js              每文档内存房间（串行队列 + 从快照+尾部加载）
 src/update-service.js    鉴权→校验→去重持久化→应用→广播→ack（含崩溃注入开关）
 src/compaction.js        压缩、双重一致性校验、存储恢复
+src/checkpoints.js       命名教学检查点（串行队列内捕获 + 存储重放校验）
 src/errorlog.js          update_errors 落库
 src/ws.js                WebSocket 协议
-src/server.js            Fastify 入口 + 管理/恢复 HTTP 端点
+src/server.js            Fastify 入口 + 管理/恢复/检查点 HTTP 端点
 scripts/lib-client.js    可控脚本客户端（手动 flush、乱序、重发、硬断线、带 SV 重连）
 scripts/client-a.js      演示客户端 A
 scripts/client-b.js      演示客户端 B
+scripts/client-checkpoint.js  检查点演示（两次编辑 + 压缩后复读）
 scripts/seed.js          demo 租户/用户/文档/成员
 test/                    端到端收敛与持久化测试
 ```

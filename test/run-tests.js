@@ -124,6 +124,19 @@ function httpPost(p, token, body) {
   });
 }
 
+function httpGetStatus(p, token) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(`${BASE}${p}`, {
+      headers: token ? { 'x-auth-token': token } : {},
+    }, (res) => {
+      let body = '';
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => resolve({ status: res.statusCode, body }));
+    });
+    req.on('error', reject);
+  });
+}
+
 async function recovered(docId, token = 'user-owner') {
   const j = JSON.parse(await httpGet(`/v1/docs/${docId}/recovered-state`, token));
   return j;
@@ -690,13 +703,102 @@ const t10 = test('T10 normal restart after persisted traffic: reconnecting clien
 });
 
 // ---------------------------------------------------------------------------
+// T11 named checkpoints: frozen at create time, immune to edits + compaction
+// ---------------------------------------------------------------------------
+const t11 = test('T11 named checkpoints keep old content/hash across edits, compaction and deleteFolded', async () => {
+  await createDoc('t11', { writers: ['user-alice'], readers: ['user-carol'], owners: ['user-owner'] });
+  const a = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't11' });
+  await a.connect();
+
+  // Edit #1 — the state the checkpoint must freeze.
+  a.localEdit((t) => t.insert(0, 'lesson-1-content'));
+  await a.flush();
+  await sleep(100);
+  const liveHashAtCheckpoint = a.stateHash();
+
+  // Create the named checkpoint as the doc owner over HTTP.
+  const cp = await httpPost('/v1/docs/t11/checkpoints', 'user-owner', { name: 'cp-lesson-1' });
+  assert.equal(cp.status, 201, `create failed: ${cp.body}`);
+  const cpBody = JSON.parse(cp.body);
+  assert.equal(cpBody.name, 'cp-lesson-1');
+  assert.equal(cpBody.createdBy, 'user-owner');
+  assert.equal(Number(cpBody.seq), 1);
+  assert.equal(cpBody.stateHash, liveHashAtCheckpoint,
+    'checkpoint hash must equal the live structural hash at capture time');
+  const cpHash = cpBody.stateHash;
+
+  // Edit #2 — the live document moves on.
+  a.localEdit((t) => t.insert(t.length, ' +lesson-2-content'));
+  await a.flush();
+  await sleep(100);
+  assert.notEqual(a.stateHash(), cpHash);
+
+  // The checkpoint still shows the OLD content and the OLD hash.
+  const read1 = JSON.parse(await httpGet('/v1/docs/t11/checkpoints/cp-lesson-1', 'user-owner'));
+  assert.equal(read1.text, 'lesson-1-content');
+  assert.equal(read1.stateHash, cpHash);
+  assert.equal(Number(read1.seq), 1);
+  // ...while the recovered CURRENT document carries both edits.
+  const now = await recovered('t11');
+  assert.ok(now.text.includes('lesson-2-content'));
+  assert.notEqual(now.stateHash, cpHash);
+
+  // Compact and PHYSICALLY DELETE the folded log rows (both updates are
+  // folded into the snapshot). The checkpoint row must be untouched.
+  const rc = await httpPost('/v1/docs/t11/compact', 'user-owner',
+    { minUpdates: 1, deleteFolded: true });
+  assert.equal(rc.status, 200);
+  assert.equal(JSON.parse(rc.body).deleted, true);
+  assert.equal(await sqlCount('doc_updates', `WHERE doc_id='t11'`), 0,
+    'all folded updates physically deleted');
+
+  const read2 = JSON.parse(await httpGet('/v1/docs/t11/checkpoints/cp-lesson-1', 'user-owner'));
+  assert.equal(read2.text, 'lesson-1-content', 'checkpoint survives log deletion');
+  assert.equal(read2.stateHash, cpHash, 'checkpoint hash unchanged by compaction');
+
+  // List endpoint (reader members may list/read, just not create).
+  const list = JSON.parse(await httpGet('/v1/docs/t11/checkpoints', 'user-carol'));
+  assert.equal(list.checkpoints.length, 1);
+  assert.equal(list.checkpoints[0].name, 'cp-lesson-1');
+  assert.equal(list.checkpoints[0].createdBy, 'user-owner');
+  assert.equal(list.checkpoints[0].stateHash, cpHash);
+  const carolRead = JSON.parse(await httpGet('/v1/docs/t11/checkpoints/cp-lesson-1', 'user-carol'));
+  assert.equal(carolRead.stateHash, cpHash);
+
+  // Permission boundary: cross-tenant and non-member cannot create or read;
+  // reader cannot create; unknown token is rejected outright.
+  assert.equal((await httpPost('/v1/docs/t11/checkpoints', 'user-dave', { name: 'x' })).status, 403);
+  assert.equal((await httpGetStatus('/v1/docs/t11/checkpoints/cp-lesson-1', 'user-dave')).status, 403);
+  assert.equal((await httpGetStatus('/v1/docs/t11/checkpoints', 'user-dave')).status, 403);
+  assert.equal((await httpPost('/v1/docs/t11/checkpoints', 'user-nobody', { name: 'x' })).status, 403);
+  assert.equal((await httpGetStatus('/v1/docs/t11/checkpoints/cp-lesson-1', 'user-nobody')).status, 403);
+  assert.equal((await httpPost('/v1/docs/t11/checkpoints', 'user-carol', { name: 'carol-cp' })).status, 403);
+  assert.equal((await httpPost('/v1/docs/t11/checkpoints', 'no-such-user', { name: 'x' })).status, 401);
+  assert.equal((await httpGetStatus('/v1/docs/t11/checkpoints/no-such-cp', 'user-owner')).status, 404);
+
+  // Duplicate name is rejected; the original row is not overwritten.
+  const dup = await httpPost('/v1/docs/t11/checkpoints', 'user-owner', { name: 'cp-lesson-1' });
+  assert.equal(dup.status, 409);
+  assert.equal((await db.query(
+    `SELECT count(*)::int AS n FROM doc_checkpoints WHERE doc_id='t11'`)).rows[0].n, 1);
+
+  // Collaboration and recovery on the CURRENT document keep working: a fresh
+  // replica converges with the live writer after all of the above.
+  const b = new DocClient({ url: WS_URL, token: 'user-owner', docId: 't11' });
+  await b.connect();
+  const conv = await settleConvergence([a, b], 't11');
+  assert.equal(conv.text, 'lesson-1-content +lesson-2-content');
+  a.close(); b.close();
+});
+
+// ---------------------------------------------------------------------------
 // runner
 // ---------------------------------------------------------------------------
 async function main() {
   await setupTest();
   await startServer({ crashAfterCommit: false });
 
-  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10];
+  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11];
   let pass = 0;
   const failures = [];
   for (const t of tests) {

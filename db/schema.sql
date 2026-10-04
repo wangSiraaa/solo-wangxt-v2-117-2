@@ -68,6 +68,26 @@ CREATE TABLE IF NOT EXISTS doc_snapshots (
     PRIMARY KEY (doc_id, id)
 );
 
+-- Named teaching checkpoints. A checkpoint captures the FULL Yjs state of a
+-- document at a specific seq, created inside the doc's serial queue from the
+-- live (consistent) room state. Rows are immutable: later updates and log
+-- compaction (including deleteFolded) never rewrite a checkpoint, so the
+-- captured state/hash remain readable as long as the row exists.
+CREATE TABLE IF NOT EXISTS doc_checkpoints (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY,
+    doc_id          TEXT NOT NULL REFERENCES documents(id),
+    name            TEXT NOT NULL,
+    created_by      TEXT NOT NULL REFERENCES users(id),
+    seq             BIGINT NOT NULL,          -- doc seq at capture time
+    state_bytes     BYTEA NOT NULL,           -- full Yjs state at capture time
+    state_hash      TEXT NOT NULL,            -- sha256 of state_bytes
+    byte_len        INTEGER GENERATED ALWAYS AS (octet_length(state_bytes)) STORED,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (doc_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoints_doc ON doc_checkpoints(doc_id, created_at);
+
 -- Unknown / malformed / corrupt frames land here, with enough context to
 -- locate the source (which connection/user/doc, raw payload, failure reason).
 CREATE TABLE IF NOT EXISTS update_errors (
