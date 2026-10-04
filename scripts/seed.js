@@ -8,7 +8,7 @@ const db = require('../src/db');
 
 async function seed({ reset = false } = {}) {
   if (reset) {
-    await db.query(`TRUNCATE update_errors, doc_snapshots, doc_updates,
+    await db.query(`TRUNCATE update_errors, doc_checkpoints, doc_snapshots, doc_updates,
                     document_members, documents, users, tenants RESTART IDENTITY CASCADE`);
   }
 

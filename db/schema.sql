@@ -68,6 +68,27 @@ CREATE TABLE IF NOT EXISTS doc_snapshots (
     PRIMARY KEY (doc_id, id)
 );
 
+-- Named teaching checkpoints. A checkpoint pins the FULL Yjs state of the
+-- document at the seq captured inside the doc's serial queue; `state_hash`
+-- is sha256 of `state_bytes`. Rows are immutable by construction: normal
+-- traffic only appends to doc_updates, and compaction only writes
+-- doc_snapshots / marks or deletes doc_updates — neither ever rewrites a
+-- checkpoint, so it stays readable (old content, old hash) even after the
+-- folded log rows are physically deleted.
+CREATE TABLE IF NOT EXISTS doc_checkpoints (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY,
+    doc_id          TEXT NOT NULL REFERENCES documents(id),
+    name            TEXT NOT NULL,
+    created_by      TEXT NOT NULL REFERENCES users(id),
+    seq             BIGINT NOT NULL,          -- all updates seq <= this are captured
+    state_bytes     BYTEA NOT NULL,           -- full Yjs state encoding at capture
+    state_hash      TEXT NOT NULL,
+    byte_len        INTEGER GENERATED ALWAYS AS (octet_length(state_bytes)) STORED,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (doc_id, id),
+    UNIQUE (doc_id, name)
+);
+
 -- Unknown / malformed / corrupt frames land here, with enough context to
 -- locate the source (which connection/user/doc, raw payload, failure reason).
 CREATE TABLE IF NOT EXISTS update_errors (

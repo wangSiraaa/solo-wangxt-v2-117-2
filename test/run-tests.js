@@ -103,6 +103,19 @@ function httpGet(p, token) {
   });
 }
 
+function httpGetStatus(p, token) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(`${BASE}${p}`, {
+      headers: token ? { 'x-auth-token': token } : {},
+    }, (res) => {
+      let body = '';
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => resolve({ status: res.statusCode, body }));
+    });
+    req.on('error', reject);
+  });
+}
+
 function httpPost(p, token, body) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body || {});
@@ -690,13 +703,105 @@ const t10 = test('T10 normal restart after persisted traffic: reconnecting clien
 });
 
 // ---------------------------------------------------------------------------
+// T11 named checkpoints: consistent capture, immutable under later edits and
+// compaction, member-guarded
+// ---------------------------------------------------------------------------
+const t11 = test('T11 named checkpoints keep old state after later edits and log deletion; non-members denied', async () => {
+  await createDoc('t11', { writers: ['user-alice'], readers: ['user-carol'], owners: ['user-owner'] });
+  const a = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't11' });
+  await a.connect();
+
+  // Edit #1 lands; this is exactly the state the checkpoint must capture.
+  a.localEdit((t) => t.insert(0, 'lesson-v1'));
+  await a.flush();
+  await sleep(100);
+  const atCheckpoint = await rebuildAndHash('t11');
+
+  // Owner pins a named checkpoint through the member-guarded API.
+  const mk = await httpPost('/v1/docs/t11/checkpoints', 'user-owner', { name: 'lesson-1' });
+  assert.equal(mk.status, 200);
+  const cp = JSON.parse(mk.body);
+  assert.equal(cp.name, 'lesson-1');
+  assert.equal(cp.createdBy, 'user-owner');
+  assert.equal(cp.seq, 1);
+  assert.equal(cp.stateHash, atCheckpoint.hash, 'checkpoint hash == live hash at capture');
+
+  // Editing continues after the checkpoint (edits #2 and #3).
+  a.localEdit((t) => t.insert(t.length, '+v2'));
+  await a.flush();
+  a.localEdit((t) => t.insert(t.length, '+v3'));
+  await a.flush();
+  await sleep(100);
+
+  // The checkpoint still shows the OLD content and OLD hash...
+  const r1 = JSON.parse(await httpGet(`/v1/docs/t11/checkpoints/${cp.id}`, 'user-owner'));
+  assert.equal(r1.stateHash, atCheckpoint.hash);
+  assert.equal(r1.text, 'lesson-v1');
+  assert.equal(r1.seq, 1);
+  // ...and the stored bytes really hash to the stored hash.
+  const bytes1 = Buffer.from(r1.state, 'base64');
+  assert.equal(crypto.createHash('sha256').update(bytes1).digest('hex'), r1.stateHash);
+
+  // The live document moved on.
+  const live = await recovered('t11');
+  assert.equal(live.text, 'lesson-v1+v2+v3');
+  assert.notEqual(live.stateHash, r1.stateHash);
+
+  // Compact AND physically delete the folded log rows: the checkpoint is
+  // stored independently of the update log and must remain readable and
+  // byte-identical afterwards.
+  const comp = await httpPost('/v1/docs/t11/compact', 'user-owner', { minUpdates: 1, deleteFolded: true });
+  assert.equal(comp.status, 200);
+  assert.equal(JSON.parse(comp.body).deleted, true);
+  assert.equal(await sqlCount('doc_updates', `WHERE doc_id='t11'`), 0);
+
+  const r2 = JSON.parse(await httpGet(`/v1/docs/t11/checkpoints/${cp.id}`, 'user-owner'));
+  assert.equal(r2.stateHash, atCheckpoint.hash);
+  assert.equal(r2.text, 'lesson-v1');
+
+  // List endpoint returns the metadata; a reader member may read.
+  const list = JSON.parse(await httpGet('/v1/docs/t11/checkpoints', 'user-carol'));
+  assert.equal(list.checkpoints.length, 1);
+  assert.equal(list.checkpoints[0].name, 'lesson-1');
+  assert.equal(list.checkpoints[0].stateHash, atCheckpoint.hash);
+  const readerGet = await httpGetStatus(`/v1/docs/t11/checkpoints/${cp.id}`, 'user-carol');
+  assert.equal(readerGet.status, 200);
+
+  // ...but a reader may not create.
+  const readerMk = await httpPost('/v1/docs/t11/checkpoints', 'user-carol', { name: 'nope' });
+  assert.equal(readerMk.status, 403);
+  assert.equal(JSON.parse(readerMk.body).error, 'READ_ONLY');
+
+  // Cross-tenant and non-member callers can neither create nor read.
+  for (const tok of ['user-dave', 'user-nobody']) {
+    assert.equal((await httpPost('/v1/docs/t11/checkpoints', tok, { name: 'x' })).status, 403);
+    assert.equal((await httpGetStatus('/v1/docs/t11/checkpoints', tok)).status, 403);
+    assert.equal((await httpGetStatus(`/v1/docs/t11/checkpoints/${cp.id}`, tok)).status, 403);
+  }
+  // Unknown token.
+  assert.equal((await httpGetStatus('/v1/docs/t11/checkpoints', 'no-such-user')).status, 401);
+  // Duplicate name, empty name, unknown checkpoint id.
+  assert.equal((await httpPost('/v1/docs/t11/checkpoints', 'user-owner', { name: 'lesson-1' })).status, 409);
+  assert.equal((await httpPost('/v1/docs/t11/checkpoints', 'user-owner', { name: '  ' })).status, 400);
+  assert.equal((await httpGetStatus('/v1/docs/t11/checkpoints/9999', 'user-owner')).status, 404);
+
+  // Collaboration and recovery on the live document are unaffected: a fresh
+  // client converges on the post-checkpoint state.
+  const fresh = new DocClient({ url: WS_URL, token: 'user-owner', docId: 't11' });
+  await fresh.connect();
+  const conv = await settleConvergence([a, fresh], 't11');
+  assert.equal(conv.text, 'lesson-v1+v2+v3');
+  a.close(); fresh.close();
+});
+
+// ---------------------------------------------------------------------------
 // runner
 // ---------------------------------------------------------------------------
 async function main() {
   await setupTest();
   await startServer({ crashAfterCommit: false });
 
-  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10];
+  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11];
   let pass = 0;
   const failures = [];
   for (const t of tests) {

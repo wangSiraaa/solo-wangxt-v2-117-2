@@ -30,6 +30,7 @@ HTTP/WebSocket，PostgreSQL 保存只增的更新日志与压缩快照。不存�
                     PostgreSQL
                     doc_updates      只增更新日志 (doc_id, seq) / (doc_id, client_msg_id)
                     doc_snapshots    压缩快照（through_seq + state + sha256）
+                    doc_checkpoints  命名检查点（seq + 完整 Yjs 状态 + sha256，不可变）
                     update_errors    未知/损坏/越权帧的可定位错误
 ```
 
@@ -76,6 +77,24 @@ hello 和 `sync-req` 都接受 Yjs 状态向量：服务器返回
    文档逐字节相等——直接验证「压缩/删除日志后仍可恢复文档内容」。
 
 恢复永远走 `snapshot(through_seq=N)` + `updates(seq > N)`（T6）。
+
+### 命名检查点（教学检查点）
+
+文档负责人可以在协作进行中钉一个**命名检查点**，之后随时回看当时的状态，
+不影响当前编辑，也不提供回滚：
+
+* `POST /v1/docs/:docId/checkpoints {name}` → 创建（writer/owner；reader 得
+  `READ_ONLY`）。在该文档的**串行队列内**执行：`room.doc` 的完整 Yjs 状态、
+  当前 `seq`、sha256 哈希作为一致切面一起落库，更新无法插队。
+* `GET /v1/docs/:docId/checkpoints` → 列出（任何在册成员，含 reader）。
+* `GET /v1/docs/:docId/checkpoints/:id` → 读取：元数据 + base64 完整状态 +
+  解码文本。
+
+不可变性是结构性的：检查点行只写一次，普通更新只追加 `doc_updates`，压缩只
+写 `doc_snapshots` 并标记/删除 `doc_updates`——两条路径都不触碰
+`doc_checkpoints`。因此创建后继续编辑，检查点仍显示旧内容与旧哈希；压缩并
+物理删除已折叠日志后检查点依然可读（T11）。`(doc_id, name)` 唯一，重名返回
+`409 NAME_TAKEN`；跨租户与非成员对三个接口一律 `403`，未知 token `401`。
 
 ### 未知 / 损坏更新可定位
 
@@ -159,6 +178,12 @@ curl -s -H 'x-auth-token: user-owner' \
   http://127.0.0.1:7777/v1/docs/doc-demo/recovered-state
 ```
 
+检查点演示（编辑 → 钉检查点 → 继续编辑 → 压缩并删除日志，检查点始终可读且不变）：
+
+```bash
+npm run demo:checkpoint
+```
+
 种子身份（demo 用，用户 id 即 bearer token）：
 
 | 用户 | 租户 | 对 doc-demo 的角色 |
@@ -191,6 +216,7 @@ npm test
 | T8 | 非成员、跨租户、未知 token、reader 写、会话中途撤销权限、HTTP 端点越权全部被拒 |
 | T9 | 3 客户端 60 个最大并发的插入/删除，收敛到同一哈希；日志恰好 61 行，无丢失/重复 |
 | T10 | 正常 SIGTERM 重启后，旧 SV 重连与冷副本全量加入都与重启前哈希一致，且不重复落库 |
+| T11 | 检查点创建后继续编辑仍显示旧内容/旧哈希；压缩并物理删除已折叠日志后仍可读；reader 可读不可建，跨租户/非成员一律 403；当前文档协作与恢复不受影响 |
 
 ---
 
@@ -205,12 +231,14 @@ src/yutil.js             Yjs 文档/状态向量/差异/校验/恢复
 src/room.js              每文档内存房间（串行队列 + 从快照+尾部加载）
 src/update-service.js    鉴权→校验→去重持久化→应用→广播→ack（含崩溃注入开关）
 src/compaction.js        压缩、双重一致性校验、存储恢复
+src/checkpoints.js       命名检查点（串行队列内一致切面、不可变存储、读取解码）
 src/errorlog.js          update_errors 落库
 src/ws.js                WebSocket 协议
-src/server.js            Fastify 入口 + 管理/恢复 HTTP 端点
+src/server.js            Fastify 入口 + 管理/恢复/检查点 HTTP 端点
 scripts/lib-client.js    可控脚本客户端（手动 flush、乱序、重发、硬断线、带 SV 重连）
 scripts/client-a.js      演示客户端 A
 scripts/client-b.js      演示客户端 B
+scripts/checkpoint-demo.js  检查点演示（两次编辑夹创建，压缩删除后仍可读）
 scripts/seed.js          demo 租户/用户/文档/成员
 test/                    端到端收敛与持久化测试
 ```
